@@ -1,0 +1,2425 @@
+/*************************************************
+ * MASTER CONFIG
+ *************************************************/
+const MASTER_SPREADSHEET_ID = "1z5inOwvOylUQ841Bd2THSg-X9DMCz2Mdug-_PKdENYE"; 
+const MASTER_SHEET_NAME = "Student_Users";    
+const SCORES_SHEET = "Scores";          
+  
+const SETTINGS_SHEET = "Settings";           
+const EXAM_JSON_SHEET = "Exam_JSON";         
+const SUBMISSION_SHEET_ID = MASTER_SPREADSHEET_ID;
+const SOURCE_SPREADSHEET_ID = "1-EraCCicAgbkbSJEbH2o1DsPZVlYBpPLF-lzHyPBh0Q"; // ID of the Student Data Sheet
+// Default admin fallback list (used when no settings found)
+const DEFAULT_ADMINS = [
+  "ministryschoolpap@gmail.com",
+  "meigensmetellus@gmail.com",
+  
+  "admin1@domain.com",
+  "admin2@domain.com"
+];
+// --- GLOBAL DEBUG LOGGING ---
+var DEBUG_LOGS = [];
+function log(msg) {
+  var timestamp = new Date().toLocaleTimeString();
+  var logLine = "[" + timestamp + "] " + msg;
+  DEBUG_LOGS.push(logLine);
+  Logger.log(logLine); // Keep server log just in case
+}
+
+// ==========================================
+// 🛠️ DEBUGGING SYSTEM (LOGS TO FRONTEND)
+// ==========================================
+var DEBUG_LOGS = [];
+
+function log(msg) {
+  var timestamp = new Date().toLocaleTimeString();
+  var line = "[" + timestamp + "] " + msg;
+  DEBUG_LOGS.push(line);
+  Logger.log(line); // Keeps a copy in the server console too
+}
+
+function doGet(e) {
+  checkAndInitSheets();
+  
+  const page = (e && e.parameter && e.parameter.page) ? e.parameter.page : "index";
+  const examName = (e && e.parameter && e.parameter.exam) ? e.parameter.exam : "";
+  
+  // 1. Grab Token from URL
+  let token = (e && e.parameter && e.parameter.token) ? e.parameter.token : null;
+
+  // ======================================================
+  // 👑 MASTER AUTO-LOGIN (The Fix)
+  // If no token is provided, we check if YOU (The Owner) are visiting.
+  // ======================================================
+  if (page === "admin" && !token) {
+    const activeUser = Session.getActiveUser().getEmail().toLowerCase().trim();
+    const effectiveUser = Session.getEffectiveUser().getEmail().toLowerCase().trim();
+
+    // "Effective User" is the account that owns the script (You).
+    // "Active User" is the person visiting the page.
+    if (activeUser === effectiveUser) {
+       // It's YOU! Generate a Master Token automatically.
+       token = Utilities.getUuid();
+       // Save this token in the cache so getViewerInfo respects it
+       CacheService.getScriptCache().put(token, activeUser, 21600); // 6 Hours
+    }
+  }
+  // ======================================================
+
+  // 2. Sync Data (Safe Mode)
+  try { syncStudentDataOnLoad(); } catch(err) {}
+
+  // 3. Check Student Login
+  const logged = getLoggedInStudent(token);
+
+  // 4. ROUTING
+  if (page === "admin") {
+    // If we have a token (either from URL or Auto-Generated for Master), load Admin.
+    if (token) {
+      const t = HtmlService.createTemplateFromFile("Admin");
+      t.token = token; // Pass the token to the HTML
+      return t.evaluate()
+              .setTitle("Panneau d'Administration")
+              .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+              .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+    }
+
+    // If no token (and not Master), show Login.
+    const t = HtmlService.createTemplateFromFile("AdminLogin");
+    t.url = ScriptApp.getService().getUrl();
+    return t.evaluate()
+            .setTitle("Connexion Admin")
+            .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+            .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+
+  // ... (Rest of your pages: login, review, quiz, index) ...
+  
+  if (page === "login") {
+    if (logged.success) {
+      const t = HtmlService.createTemplateFromFile("Review");
+      t.student = logged.student; t.token = token; 
+      return t.evaluate().setTitle("Vos Rapports").setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL).addMetaTag('viewport', 'width=device-width, initial-scale=1');
+    }
+    const t = HtmlService.createTemplateFromFile("Login");
+    t.targetPage = "review"; t.targetExam = examName;
+    return t.evaluate().setTitle("Connexion").setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL).addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+
+  // Exam Page
+  if (examName && page !== "review") {
+     const settings = getSpecificExamSettings(examName, logged.success ? logged.student.Student_ID : null);
+     if (String(settings.AcceptResponses).toUpperCase() === "FALSE") {
+       return HtmlService.createHtmlOutput("<h2 style='color:red;text-align:center;font-family:sans-serif;'>Examen fermé.</h2>");
+     }
+     const t = HtmlService.createTemplateFromFile(examName);
+     t.examName = examName; t.token = token || ""; t.student = logged.success ? logged.student : null;
+     return t.evaluate().setTitle("Examen").setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL).addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+
+  return render("Index", "Accueil — LWSM");
+}
+/**
+ * Fonction helper pour le rendu des fichiers HTML
+ */
+function render(file, title) {
+  return HtmlService.createTemplateFromFile(file)
+    .evaluate()
+    .setTitle(title)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+/**
+ * Récupère les données temporaires pour l'écran de création de PIN
+ */
+function getTemporaryUser() {
+  const data = CacheService.getScriptCache().get("temp_setup_user");
+  return data ? JSON.parse(data) : null;
+}
+function hashPin(pin) {
+  const raw = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, pin, Utilities.Charset.UTF_8);
+  return raw.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, '0')).join("");
+}
+
+/**
+ * Normalise le texte en un "slug" (minuscules, sans accents, sans caractères spéciaux)
+ * Cela permet de comparer "La Préparation d'un Ministre" et "preparation_ministre" équitablement.
+ */
+function toSlug(text) {
+  if (!text) return "";
+  return String(text)
+    .toLowerCase()
+    .normalize("NFD")               // Décompose les caractères accentués
+    .replace(/[\u0300-\u036f]/g, "") // Supprime les accents
+    .replace(/[^a-z0-9]/g, "_")      // Remplace tout ce qui n'est pas alphanumérique par "_"
+    .replace(/_+/g, "_")             // Remplace les doubles underscores par un seul
+    .replace(/^_|_$/g, "");          // Supprime les underscores au début et à la fin
+}
+
+/**
+ * UNIVERSAL HEADER FINDER
+ * Finds the index of the email/username column regardless of Case, Spaces, or variations.
+ */
+function findEmailColumn(headers) {
+  // Define all acceptable column names here
+  const candidates = ["username", "email", "student email", "email address", "user"];
+  
+  const normalizedHeaders = headers.map(h => String(h).toLowerCase().trim());
+  
+  for (let c of candidates) {
+    const idx = normalizedHeaders.indexOf(c);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+function getViewerInfo(token) {
+  DEBUG_LOGS = []; 
+  log(">>> getViewerInfo START. Token: " + token);
+
+  try {
+    const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+    const themeData = getStoredTheme();
+
+    // 1. Resolve Identity
+    let identity = null;
+    if (token) {
+      identity = CacheService.getScriptCache().get(token);
+      log("Cache Identity: " + identity);
+    }
+
+    const ownerEmail = Session.getEffectiveUser().getEmail().toLowerCase().trim();
+    const activeUser = Session.getActiveUser().getEmail().toLowerCase().trim();
+
+    // Master Override
+    if (!identity && activeUser === ownerEmail) {
+      identity = ownerEmail;
+      log("Used Master Override (Active User)");
+    }
+
+    if (!identity) {
+      log("FATAL: No identity found in cache or session.");
+      // RETURN ERROR SAFELY INSTEAD OF THROWING
+      return { success: false, error: "AUTH_FAIL: Session expirée.", logs: DEBUG_LOGS.join("\n") };
+    }
+
+    identity = String(identity).trim();
+
+    // 2. Master Check
+    if (identity.toLowerCase() === ownerEmail) {
+      log("Role: Master (Google Account)");
+      return {
+        success: true, // Mark as success
+        email: ownerEmail, role: "Master",
+        permissions: { p_pic:true, p_name:true, p_dossier:true, p_settings:true, p_manual:true, p_review:true, p_build:true },
+        isMaster: true, isAdmin: true, theme: themeData
+      };
+    }
+
+    // 3. Sheet User Check
+    log("Role: Staff (Checking Sheet...)");
+    const sh = ss.getSheetByName("Users");
+    const data = sh.getDataRange().getValues();
+    const headers = data[0];
+
+    const loginColIdx = findEmailColumn(headers); 
+    
+    if (loginColIdx === -1) {
+      log("FATAL: Column 'Email/User' not found in headers: " + JSON.stringify(headers));
+      return { success: false, error: "CONFIG_ERROR: Colonne utilisateur introuvable.", logs: DEBUG_LOGS.join("\n") };
+    }
+
+    log("Scanning column index " + loginColIdx + " for user: " + identity);
+    const row = data.slice(1).find(r => String(r[loginColIdx]).toLowerCase().trim() === identity.toLowerCase());
+
+    if (!row) {
+      log("FATAL: User '" + identity + "' not found in row data.");
+      return { success: false, error: "AUTH_FAIL: Utilisateur introuvable.", logs: DEBUG_LOGS.join("\n") };
+    }
+
+    log("User found. Loading permissions...");
+    // Map permissions...
+    const headersNorm = headers.map(h => String(h).toLowerCase().trim());
+    const checkPerm = (colName) => {
+      const idx = headersNorm.indexOf(colName.toLowerCase());
+      return idx !== -1 && String(row[idx]).toUpperCase() === "TRUE";
+    };
+
+    const roleIdx = headersNorm.indexOf("role");
+
+    return {
+      success: true, // Mark as success
+      email: identity,
+      role: roleIdx !== -1 ? row[roleIdx] : "Staff",
+      permissions: {
+        p_pic: checkPerm("p_pic"),
+        p_name: checkPerm("p_name"),
+        p_dossier: checkPerm("p_dossier"),
+        p_settings: checkPerm("p_settings"),
+        p_manual: checkPerm("p_manual"),
+        p_review: checkPerm("p_review"),
+        p_build: checkPerm("p_build")
+      },
+      isMaster: false, isAdmin: true, theme: themeData
+    };
+
+  } catch (e) {
+    // CATCH ALL CRASHES AND RETURN SAFELY
+    log("❌ CRITICAL EXCEPTION: " + e.toString());
+    return { 
+      success: false, 
+      error: "SERVER_CRASH: " + e.message, 
+      logs: DEBUG_LOGS.join("\n") 
+    };
+  }
+}
+/**
+ * Mise à jour pour inclure le ReleaseMode et le Slug pour le lien de consultation
+ */
+function getSpecificExamSettings(examTitle, studentCode = null) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const settingsSh = ss.getSheetByName(SETTINGS_SHEET);
+  const data = settingsSh.getDataRange().getValues();
+  const headers = data[0];
+  
+  const titleIdx = headers.indexOf("ExamTitle");
+  const acceptIdx = headers.indexOf("AcceptResponse") !== -1 ? headers.indexOf("AcceptResponse") : headers.indexOf("AcceptResponses");
+  const releaseIdx = headers.indexOf("ReleaseMode");
+
+  const row = data.find(r => String(r[titleIdx]).trim() === String(examTitle).trim());
+  if (!row) return { AcceptResponses: "FALSE" };
+
+  const releaseMode = String(row[releaseIdx] || "hidden").toLowerCase();
+  const slug = toSlug(examTitle);
+
+  // Vérification si déjà réussi
+  if (studentCode) {
+    const scoresSh = ss.getSheetByName(SCORES_SHEET);
+    const sData = scoresSh.getDataRange().getValues();
+    const sHeaders = sData[0];
+    const examColIdx = sHeaders.indexOf(examTitle);
+    const studentRow = sData.find(r => String(r[0]).trim() === String(studentCode).trim());
+
+    if (studentRow && examColIdx !== -1) {
+      const score = parseFloat(studentRow[examColIdx]);
+      if (!isNaN(score) && score >= 70) {
+        return { 
+          AcceptResponses: "ALREADY_PASSED", 
+          score: score, 
+          releaseMode: releaseMode,
+          examSlug: slug 
+        };
+      }
+    }
+  }
+
+  return { 
+    AcceptResponses: String(row[acceptIdx]).toUpperCase(),
+    releaseMode: releaseMode,
+    examSlug: slug
+  };
+}
+
+/**
+ * Réinitialise le mode de libération (Suite à votre "oui")
+ */
+function resetExamRelease(examTitle) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SETTINGS_SHEET);
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  const titleIdx = headers.indexOf("ExamTitle");
+  const releaseIdx = headers.indexOf("ReleaseMode");
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][titleIdx]).trim() === String(examTitle).trim()) {
+      sh.getRange(i + 1, releaseIdx + 1).setValue("manual");
+      return { success: true };
+    }
+  }
+  return { success: false };
+}
+/*************************************************
+ * Check admin permissions
+ *************************************************/
+function checkAdmin(email) {
+  if (!email) return false;
+
+  const admins = [
+    "ministryschoolpap@gmail.com",
+    "meigensmetellus@gmail.com"
+  ];
+
+  email = email.toLowerCase().trim();
+  return admins.includes(email);
+}
+
+/**
+ * MISSING FUNCTION 2: Resets a staff member's password to '123456'.
+ * Called by the "Key" button in the User List.
+ */
+function adminResetUserPassword(email) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Users");
+  const data = sh.getDataRange().getValues();
+  const headers = data[0].map(h => String(h).toLowerCase().trim());
+  
+  const emailIdx = findEmailColumn(data[0]);
+  const passIdx = headers.indexOf("password");
+  
+  if (emailIdx === -1 || passIdx === -1) return { success: false };
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][emailIdx]).toLowerCase().trim() === String(email).toLowerCase().trim()) {
+       // Reset to default hash for "123456"
+       sh.getRange(i + 1, passIdx + 1).setValue(hashPin("123456"));
+       return { success: true };
+    }
+  }
+  return { success: false };
+}
+/**
+ * Enregistre une note manuellement et envoie une notification par email.
+ * @param {Object} obj Contient studentCode, examSlug, et grade.
+ * @return {Object} Résultat avec succès (boolean) et message pour l'interface.
+ */
+function saveManualExamGrade(obj) {
+  try {
+    const { studentCode, examSlug, grade } = obj;
+
+    // Validation de base des entrées
+    if (!studentCode || !examSlug || grade === "") {
+      return { success: false, message: "Données manquantes (Code, Sujet ou Note)." };
+    }
+
+    const ss = SpreadsheetApp.openById(SUBMISSION_SHEET_ID);
+    const sh = ss.getSheetByName(SCORES_SHEET);
+
+    if (!sh) {
+      throw new Error("La feuille '" + SCORES_SHEET + "' est introuvable.");
+    }
+
+    const data = sh.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+
+    const codeIdx = headers.indexOf("Student Code");
+    const examTitle = String(examSlug).trim();
+    const examColIdx = headers.indexOf(examTitle);
+
+    if (codeIdx === -1) {
+      throw new Error("Colonne 'Student Code' introuvable dans Scores.");
+    }
+    if (examColIdx === -1) {
+      throw new Error("Matière introuvable dans les colonnes : " + examTitle);
+    }
+
+    // Trouver la ligne de l'étudiant
+    let rowIndex = -1;
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][codeIdx]).trim() === String(studentCode).trim()) {
+        rowIndex = i + 1; // +1 car index commence à 0
+        break;
+      }
+    }
+
+    // Si l'étudiant n'existe pas encore dans la feuille Scores, on l'ajoute
+    if (rowIndex === -1) {
+      sh.appendRow([studentCode]);
+      rowIndex = sh.getLastRow();
+    }
+
+    // 1️⃣ Enregistrement de la note
+    sh.getRange(rowIndex, examColIdx + 1).setValue(grade);
+
+    // 2️⃣ Récupération des infos de l'étudiant pour l'email
+    const userSh = ss.getSheetByName(MASTER_SHEET_NAME);
+    let studentEmail = "";
+    let studentName = studentCode;
+
+    if (userSh) {
+      const userData = userSh.getDataRange().getValues();
+      const userHeaders = userData[0].map(h => String(h).trim());
+
+      const idIdx = userHeaders.indexOf("Student ID");
+      const nameIdx = userHeaders.indexOf("Student_Name");
+      let emailIdx = userHeaders.indexOf("Email");
+      if (emailIdx === -1) emailIdx = userHeaders.indexOf("Student Email");
+
+      for (let i = 1; i < userData.length; i++) {
+        if (String(userData[i][idIdx]).trim() === String(studentCode).trim()) {
+          studentEmail = emailIdx !== -1 ? String(userData[i][emailIdx]).trim() : "";
+          studentName = nameIdx !== -1 ? String(userData[i][nameIdx]).trim() : studentName;
+          break;
+        }
+      }
+    }
+
+    // 3️⃣ Envoi de l'email avec validation rigoureuse
+    // Regex pour valider le format de l'email et éviter l'erreur "Invalid email"
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    
+    if (studentEmail && emailPattern.test(studentEmail)) {
+      try {
+        MailApp.sendEmail({
+          to: studentEmail,
+          subject: `Note publiée — ${examTitle}`,
+          htmlBody: `
+            <div style="font-family: Arial, sans-serif; color: #333;">
+              <p>Bonjour <b>${studentName}</b>,</p>
+              <p>Votre note pour la matière <b>${examTitle}</b> a été enregistrée avec succès.</p>
+              <div style="background: #f4f4f8; padding: 15px; border-radius: 8px; display: inline-block; border: 1px solid #ddd;">
+                <span style="font-size: 18px;">Score : <b>${grade} / 100</b></span>
+              </div>
+              <p>Vous pouvez consulter les détails sur votre portail étudiant.</p>
+              <hr style="border:none; border-top:1px solid #eee; margin: 20px 0;">
+              <p style="font-size: 11px; color: #777;">Ceci est un message automatique généré par le système Living Word.</p>
+            </div>
+          `
+        });
+      } catch (mailErr) {
+        Logger.log("Erreur d'envoi mail (mais note enregistrée) : " + mailErr.message);
+        return { success: true, message: "Note enregistrée, mais l'email n'a pas pu être envoyé (Vérifiez l'adresse)." };
+      }
+    } else if (studentEmail !== "") {
+       return { success: true, message: "Note enregistrée. Attention : l'email '" + studentEmail + "' est invalide." };
+    }
+
+    return { success: true, message: "Note enregistrée et notification envoyée !" };
+
+  } catch (e) {
+    Logger.log("ERREUR CRITIQUE saveManualExamGrade : " + e.message);
+    return { success: false, message: "Erreur système : " + e.message };
+  }
+}
+function updateUserRoleAndPerms(obj) {
+  try {
+    const ss = SpreadsheetApp.openById(SUBMISSION_SHEET_ID);
+    const sh = ss.getSheetByName("Users");
+    const fullData = sh.getDataRange().getValues();
+    const headers = fullData[0].map(h => String(h).trim());
+
+    // --- ÉTAPE A : GÉRER LA COLONNE p_name SI MANQUANTE ---
+    let nameColIdx = headers.indexOf("p_name");
+    if (nameColIdx === -1) {
+      nameColIdx = headers.length; // Index de la nouvelle colonne
+      sh.getRange(1, nameColIdx + 1).setValue("p_name").setFontWeight("bold");
+      headers.push("p_name"); // Mise à jour des en-têtes en mémoire
+    }
+
+    // --- ÉTAPE B : TROUVER OU CRÉER L'UTILISATEUR ---
+    let rowIndex = -1;
+    for (let i = 1; i < fullData.length; i++) {
+      if (String(fullData[i][0]).toLowerCase() === obj.email.toLowerCase()) {
+        rowIndex = i + 1;
+        break;
+      }
+    }
+
+    // Si c'est une création (pas trouvé), on ajoute une nouvelle ligne
+    if (rowIndex === -1) {
+      // On prépare une ligne vide de la bonne longueur
+      let newRow = new Array(headers.length).fill("");
+      newRow[0] = obj.email;
+      sh.appendRow(newRow);
+      rowIndex = sh.getLastRow();
+    }
+
+    // --- ÉTAPE C : ENREGISTRER LES PERMISSIONS ---
+    // On utilise les index dynamiques pour éviter les décalages de colonnes
+    const mapping = {
+      "Role": obj.role,
+      "p_dossier": obj.p_dossier,
+      "p_settings": obj.p_settings,
+      "p_manual": obj.p_manual,
+      "p_review": obj.p_review,
+      "p_build": obj.p_build,
+      "p_pic": obj.p_pic,
+      "p_name": obj.p_name // La nouvelle permission
+    };
+
+    // Si un mot de passe est fourni, on le met à jour
+    if (obj.password) {
+      sh.getRange(rowIndex, headers.indexOf("Password") + 1).setValue(obj.password);
+    }
+
+    // On boucle sur le mapping pour écrire dans les bonnes colonnes
+    for (let key in mapping) {
+      let colIdx = headers.indexOf(key);
+      if (colIdx !== -1) {
+        sh.getRange(rowIndex, colIdx + 1).setValue(mapping[key]);
+      }
+    }
+
+    return { success: true, status: rowIndex === -1 ? "registered" : "updated" };
+
+  } catch (e) {
+    return { success: false, message: e.toString() };
+  }
+}
+function isAdminEmail(email) {
+  if (!email) return false;
+  email = email.toLowerCase().trim();
+  
+  // 1. Hardcoded Safety Net (Always allows you in)
+  const masterAdmins = ["ministryschoolpap@gmail.com", "meigensmetellus@gmail.com"];
+  if (masterAdmins.includes(email)) return true;
+
+  // 2. Sheet Lookup
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  let sh = ss.getSheetByName("Users");
+  if (!sh) return false;
+
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  
+  // Use the robust finder
+  const emailIdx = findEmailColumn(headers);
+
+  if (emailIdx === -1) {
+    Logger.log("CRITICAL: No Email/Username column found in Users sheet.");
+    return false;
+  }
+
+  // 3. Scan rows (Trimmed and Lowercase comparison)
+  const found = data.slice(1).some(row => String(row[emailIdx]).toLowerCase().trim() === email);
+  
+  if (!found) Logger.log("Admin check failed: " + email + " not found in DB.");
+  return found;
+}
+/*************************************************
+ * getAvailableExams()
+ * - reads Scores header and returns an array of {slug, title}
+ * - header columns from 3rd column onward (0-based) are considered exam columns
+ * - slug will be header value but normalized to a slug
+ *************************************************/
+function getAvailableExams() {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  let sh = ss.getSheetByName(SCORES_SHEET);
+  if (!sh) return [];
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(h => String(h||"").trim());
+  // Standard: Student Code, Student Name, Picture_URL in first 3 columns
+  const exams = [];
+  for (let i = 3; i < header.length; i++) {
+    const title = header[i];
+    if (!title) continue;
+    // slug: remove spaces, lowercase, replace non-alphanum with underscore
+    const slug = title.toString().toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'');
+    exams.push({ slug: slug, title: title });
+  }
+  // If no exams found, fall back to common slugs
+  if (exams.length === 0) {
+    exams.push({ slug: "nt", title: "Enquête du Nouveau Testament" });
+  }
+  return exams;
+}
+
+/*************************************************
+ * getAllSubmissions() - admin-only
+ * Reads Scores sheet and returns structured objects
+ *************************************************/
+function getAllSubmissions() {
+  const email = Session.getActiveUser().getEmail();
+  if (!isAdminEmail(email)) throw new Error("Access denied");
+
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  let sh = ss.getSheetByName(SCORES_SHEET);
+  if (!sh) return [];
+
+  const values = sh.getDataRange().getValues();
+  if (!values || values.length === 0) return [];
+
+  const header = values[0].map(c => String(c||"").trim());
+  const rows = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const obj = {};
+    header.forEach((h, j) => {
+      obj[h] = row[j] !== undefined ? row[j] : "";
+    });
+    obj._row = r+1;
+    // try parse Submission_JSON if present
+    if (obj["Submission_JSON"]) {
+      try { obj.Submission_JSON_parsed = JSON.parse(obj["Submission_JSON"]); } catch(e) { obj.Submission_JSON_parsed = null; }
+    } else {
+      obj.Submission_JSON_parsed = null;
+    }
+    rows.push(obj);
+  }
+  return rows;
+}
+
+/**
+ * ADMIN — return the list of completed exams for a student
+ */
+function getCompletedExams(studentCode) {
+  Logger.log("=== getCompletedExams() CALLED ===");
+  Logger.log("StudentCode received: " + studentCode);
+
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SCORES_SHEET);
+  if (!sh) {
+    Logger.log("ERROR: Scores sheet not found!");
+    return [];
+  }
+
+  const data = sh.getDataRange().getValues();
+  const header = data.shift().map(h => String(h || "").trim());
+
+  Logger.log("Header columns: " + JSON.stringify(header));
+
+  const codeIdx = header.indexOf("Student Code");
+  if (codeIdx === -1) {
+    Logger.log("ERROR: 'Student Code' column missing!");
+    return [];
+  }
+
+  const exams = [];
+
+  for (let r = 0; r < data.length; r++) {
+    const rowCode = String(data[r][codeIdx]).trim();
+    if (rowCode === String(studentCode).trim()) {
+
+      Logger.log("Student row found at row: " + (r + 2));
+
+      // loop through each exam column (C onward)
+      for (let c = 2; c < header.length; c++) {
+        const examTitle = header[c];
+        const score = data[r][c];
+
+        if (score !== "" && score !== null && score !== undefined) {
+          exams.push({
+            slug: examTitleToSlug(examTitle),
+            title: examTitle,
+            score: score
+          });
+
+          Logger.log(`Exam found: ${examTitle} (slug: ${examTitleToSlug(examTitle)}), score=${score}`);
+        }
+      }
+      break;
+    }
+  }
+
+  if (exams.length === 0) Logger.log("No completed exams for student.");
+
+  Logger.log("=== END getCompletedExams() ===\nReturned: " + JSON.stringify(exams));
+  return exams;
+}
+function examTitleToSlug(title){
+  return title.toLowerCase().replace(/[^a-z0-9]/g,"");
+}
+function verifyStudentLogin(code4, pin) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(MASTER_SHEET_NAME);
+  const data = sh.getDataRange().getValues();
+  const headers = data.shift();
+
+  const idIdx = headers.indexOf("Student ID");
+  const pinIdx = headers.indexOf("PIN");
+  const nameIdx = headers.indexOf("Student_Name");
+
+  // Recherche de l'étudiant par les 4 derniers chiffres
+  let foundRow = data.find(row => String(row[idIdx]).endsWith(String(code4)));
+
+  if (!foundRow) return { success: false, error: "Identifiant introuvable." };
+
+  const fullId = foundRow[idIdx];
+  const storedPin = String(foundRow[pinIdx] || "").trim();
+
+  // Vérification du PIN
+  if (hashPin(pin) === storedPin) {
+    const student = { Student_ID: fullId, Student_Name: foundRow[nameIdx] };
+    
+    // Création de la session temporaire (UserProperties)
+    // On peut aussi vider le cache ici pour repartir à zéro
+    setLoggedInStudent(student); 
+    
+    return { success: true, student: student };
+  }
+
+  return { success: false, error: "Code PIN incorrect." };
+}
+
+/**
+ * Assurez-vous que cette fonction est présente pour l'enregistrement final
+ */
+function setupInitialPin(fullId, newPin) {
+  try {
+    const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+    const sh = ss.getSheetByName(MASTER_SHEET_NAME);
+    const data = sh.getDataRange().getValues();
+    const headers = data[0];
+    const idIdx = headers.indexOf("Student ID");
+    const pinIdx = headers.indexOf("PIN");
+
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][idIdx]).trim() === String(fullId).trim()) {
+        sh.getRange(i + 1, pinIdx + 1).setValue(hashPin(newPin));
+        // Nettoyage du cache après succès
+        CacheService.getScriptCache().remove("temp_setup_user");
+        return { success: true };
+      }
+    }
+    return { success: false, error: "Identifiant introuvable." };
+  } catch (e) {
+    return { success: false, error: e.toString() };
+  }
+}
+function setLoggedInStudent(student) {
+  PropertiesService.getUserProperties().setProperty(
+    "loggedStudent",
+    JSON.stringify(student)
+  );
+}
+
+// Remove the old setLoggedInStudent function entirely. It is dangerous.
+
+function getLoggedInStudent(token) {
+  // If no token is provided, stop immediately.
+  if (!token) return { success: false };
+
+  // Fetch the data associated with the token
+  const cachedData = CacheService.getScriptCache().get(token);
+  
+  // If the token is expired or invalid, stop.
+  if (!cachedData) return { success: false };
+
+  // --- THE FIX: TRY / CATCH BLOCK ---
+  try {
+    // We try to read it as Student Data (JSON)
+    const student = JSON.parse(cachedData);
+    
+    // If it works and has an ID, it's a valid Student
+    if (student && student.Student_ID) {
+      return { success: true, student: student };
+    }
+  } catch (e) {
+    // 🚨 ERROR CAUGHT! 
+    // This happens when an ADMIN logs in. Their data is just text (e.g. "email@gmail.com").
+    // JSON.parse fails on plain text.
+    // We catch the error silently and return false. 
+    // This lets doGet() continue running so it can load the Admin Panel.
+    return { success: false };
+  }
+
+  return { success: false };
+}
+/**
+ * Charge le rapport d'examen en vérifiant le statut de libération dans Settings
+ */
+function loadStudentExam(slug) {
+  const logged = getLoggedInStudent(); // Vérifie la session
+  if (!logged.success) return null;
+
+  const studentCode = String(logged.student.Student_ID).trim();
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID); //
+  
+  // 1. Détecter le titre de l'examen via le slug
+  const scoresSheet = ss.getSheetByName(SCORES_SHEET); //
+  const header = scoresSheet.getDataRange().getValues()[0].map(h => String(h || "").trim());
+  
+  const examTitle = header.find(t => t.toLowerCase().replace(/\s+/g, "") === slug.toLowerCase().replace(/\s+/g, ""));
+  if (!examTitle) return null;
+
+  // 2. Vérifier le ReleaseMode dans la feuille Settings
+  const settingsSh = ss.getSheetByName(SETTINGS_SHEET); //
+  const sData = settingsSh.getDataRange().getValues();
+  const sHeaders = sData[0];
+  const titleIdx = sHeaders.indexOf("ExamTitle"); //
+  const releaseIdx = sHeaders.indexOf("ReleaseMode"); //
+
+  const settingRow = sData.find(r => String(r[titleIdx]).trim() === examTitle);
+  const releaseMode = settingRow ? String(settingRow[releaseIdx]).toLowerCase() : "hidden";
+
+  // 3. Appliquer la restriction
+  if (releaseMode === "hidden") {
+    return { error: "Les résultats ne sont pas encore disponibles." };
+  }
+
+  // 4. Récupérer le score et les questions (JSON)
+  const jsonSh = ss.getSheetByName(EXAM_JSON_SHEET); //
+  const jData = jsonSh.getDataRange().getValues();
+  let questions = [];
+  let score = "";
+
+  for (let i = jData.length - 1; i >= 1; i--) {
+    if (String(jData[i][0]).trim() === studentCode && String(jData[i][1]).trim() === examTitle) {
+      score = jData[i][3];
+      // Si mode manual, on ne renvoie pas les questions, seulement le score
+      if (releaseMode === "immediate") {
+        questions = JSON.parse(jData[i][4] || "[]");
+      }
+      break;
+    }
+  }
+
+  return {
+    examTitle: examTitle,
+    score: score,
+    questions: questions,
+    mode: releaseMode
+  };
+}
+function reviewSubmission(updates) {
+  const email = Session.getActiveUser().getEmail();
+  if (!isAdminEmail(email)) throw new Error("Access denied");
+
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SCORES_SHEET);
+  if (!sh) throw new Error("Scores sheet not found");
+
+  const data = sh.getDataRange().getValues();
+  const header = data[0].map(h => String(h || "").trim());
+
+  const codeIdx = header.indexOf("Student Code");
+  if (codeIdx === -1) throw new Error("Student Code column missing");
+
+  // Find exam column (title preferred, fallback to slug)
+  let examColIdx = header.indexOf(updates.examTitle);
+  if (examColIdx === -1) {
+    examColIdx = header.indexOf(updates.examSlug);
+  }
+  if (examColIdx === -1) throw new Error("Exam column not found");
+
+  // Find student row
+  let rowIndex = -1;
+  for (let r = 1; r < data.length; r++) {
+    if (String(data[r][codeIdx]).trim() === String(updates.studentCode).trim()) {
+      rowIndex = r + 1;
+      break;
+    }
+  }
+  if (rowIndex === -1) throw new Error("Student not found");
+
+  // 1️⃣ Save final score
+  sh.getRange(rowIndex, examColIdx + 1).setValue(updates.finalScore);
+
+  // 2️⃣ Archive correction JSON
+  let jsonSh = ss.getSheetByName("Exam_JSON");
+  if (!jsonSh) {
+    jsonSh = ss.insertSheet("Exam_JSON");
+    jsonSh.appendRow([
+      "Student Code",
+      "Exam Slug",
+      "Timestamp",
+      "Score",
+      "JSON",
+      "Corrected_By"
+    ]);
+  }
+
+  jsonSh.appendRow([
+    updates.studentCode,
+    updates.examSlug,
+    new Date(),
+    updates.finalScore,
+    JSON.stringify(updates.corrections || []),
+    email
+  ]);
+
+  // 3️⃣ SEND CORRECTION + SCORE TO STUDENT (FINAL RELEASE)
+  submitScoreAndSend({
+    studentCode: updates.studentCode,
+    studentNameProvided: updates.studentName || "",
+    subjectName: updates.examTitle,
+    score: updates.finalScore,
+    corrections: updates.corrections || []
+  });
+
+  return { success: true };
+}
+
+
+/**
+ * HELPER: Fetch the saved theme from Settings Sheet
+ */
+function getStoredTheme() {
+  try {
+    const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+    const sh = ss.getSheetByName("Settings");
+    if (!sh) return null;
+
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const themeCol = headers.indexOf("ThemeJSON") + 1;
+    
+    // Read from Row 2 (Value Row)
+    if (themeCol > 0 && sh.getLastRow() > 1) {
+      return sh.getRange(2, themeCol).getValue();
+    }
+  } catch(e) {
+    Logger.log("Theme fetch error: " + e);
+  }
+  return null;
+}
+/**
+ * Récupère les scores et gère les cas vides (évite undefined)
+ */
+function getStudentScores(studentCode) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SCORES_SHEET);
+  const data = sh.getDataRange().getValues();
+  const header = data.shift();
+  const codeIndex = header.indexOf("Student Code");
+
+  let row = data.find(r => String(r[codeIndex]).trim() === String(studentCode).trim());
+  if (!row) return [];
+
+  return header.slice(2).map((h, i) => ({
+    hw: h,
+    score: (row[i + 2] === "" || row[i + 2] === undefined) ? "" : row[i + 2] // Laisse vide si manquant
+  }));
+}
+/*************************************************
+ * releaseAllResults()
+ * - admin-only
+ * - marks Released = TRUE in Scores sheet and attempts to send email if possible
+ *************************************************/
+function releaseAllResults() {
+getViewerInfo(token);
+  if (!viewer.isAdmin) throw new Error("Access denied");
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SCORES_SHEET);
+  if (!sh) return { success: false, error: "Scores sheet missing" };
+  const values = sh.getDataRange().getValues();
+  const header = values.shift().map(h => String(h||"").trim());
+  const relIdx = header.indexOf("Released");
+  const finalIdx = header.indexOf("Final_Score");
+  const codeIdx = header.indexOf("Student Code");
+  const nameIdx = header.indexOf("Student Name");
+  const emailIdx = header.indexOf("Student Email") !== -1 ? header.indexOf("Student Email") : header.indexOf("Email");
+
+  let sent = 0;
+  for (let r = 0; r < values.length; r++) {
+    const rowNum = r + 2;
+    // mark released
+    if (relIdx === -1) {
+      header.push("Released");
+      sh.getRange(1,1,1,header.length).setValues([header]);
+    }
+    sh.getRange(rowNum, (relIdx !== -1 ? relIdx : header.indexOf("Released")) + 1).setValue("TRUE");
+
+    // send email if possible
+    try {
+      const to = (emailIdx !== -1 ? values[r][emailIdx] : "") || "";
+      const finalScore = (finalIdx !== -1 ? values[r][finalIdx] : "");
+      const studentName = (nameIdx !== -1 ? values[r][nameIdx] : values[r][codeIdx] || "");
+      if (to && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+        const html = `<h3>Correction publiée</h3><p>${studentName}, votre note finale: <strong>${finalScore}</strong></p>`;
+        MailApp.sendEmail({ to: to, subject: "Correction publiée — Examen", htmlBody: html });
+        sent++;
+      }
+    } catch (e) {
+      Logger.log("releaseAllResults: email failed row " + (r+2) + " : " + e.toString());
+    }
+  }
+  return { success: true, sent: sent };
+}
+
+/*************************************************
+ * exportAllAsCSV()
+ *************************************************/
+function exportAllAsCSV() {
+  const email = Session.getActiveUser().getEmail();
+  if (!isAdminEmail(email)) throw new Error("Access denied");
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SCORES_SHEET);
+  if (!sh) return "";
+  const data = sh.getDataRange().getValues();
+  return data.map(row => row.map(c => `"${String(c||"").replace(/"/g,'""')}"`).join(",")).join("\n");
+}
+
+
+/*************************************************
+ * SET / CREATE PIN
+ *************************************************/
+function setStudentPin(fullCode, newPin) {
+
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(MASTER_SHEET_NAME);
+
+  const data = sh.getDataRange().getValues();
+  const headers = data.shift();
+
+  const idIdx  = headers.indexOf("Student ID");
+  const pinIdx = headers.indexOf("PIN");
+
+  const hashed = hashPin(newPin);
+
+  for (let r = 0; r < data.length; r++) {
+    if (String(data[r][idIdx]).trim() === String(fullCode).trim()) {
+      sh.getRange(r + 2, pinIdx + 1).setValue(hashed);
+      return { success: true };
+    }
+  }
+
+  return { success: false };
+}
+
+function getDriveThumbnail(url) {
+  if (!url) return null;
+
+  // Case 1: ?id=FILEID
+  let idMatch = url.match(/id=([a-zA-Z0-9_-]+)/);
+  if (idMatch) return "https://drive.google.com/thumbnail?id=" + idMatch[1];
+
+  // Case 2: /d/FILEID/
+  idMatch = url.match(/\/d\/([a-zA-Z0-9_-]+)\//);
+  if (idMatch) return "https://drive.google.com/thumbnail?id=" + idMatch[1];
+
+  // Case 3: direct ID only
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(url)) {
+    return "https://drive.google.com/thumbnail?id=" + url;
+  }
+
+  // Default: return original
+  return url;
+}
+
+function logoutStudent() {
+  PropertiesService.getUserProperties().deleteProperty("loggedStudent");
+  return { success: true };
+}
+/*************************************************
+ * HASH PIN — SHA256
+ *************************************************/
+function hashPin(pin) {
+  const raw = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    pin,
+    Utilities.Charset.UTF_8
+  );
+
+  return raw.map(b => {
+    const v = (b < 0 ? b + 256 : b).toString(16);
+    return v.length === 1 ? "0" + v : v;
+  }).join("");
+}
+function getAllAdminUsers(token) { // <--- Added token
+  try {
+    const viewer = getViewerInfo(token); // <--- Passed token
+    // Note: We might allow 'Master' or 'Admin' to see this list
+    if (!viewer.isAdmin) return []; 
+
+    const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+    const sh = ss.getSheetByName("Users");
+    if (!sh) return [];
+
+    const data = sh.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim().toLowerCase());
+    
+    const emailIdx = findEmailColumn(data[0]);
+    const roleIdx = headers.indexOf("role");
+
+    if (emailIdx === -1) return [];
+
+    return data.slice(1).filter(row => row[emailIdx]).map(row => {
+      const getPerm = (name) => {
+        const idx = headers.indexOf(name.toLowerCase());
+        return idx !== -1 ? (String(row[idx]).toUpperCase() === "TRUE") : false;
+      };
+
+      return {
+        email: String(row[emailIdx]),
+        role: row[roleIdx] || "Staff",
+        permissions: {
+          p_pic: getPerm("p_pic"),
+          p_name: getPerm("p_name"),
+          p_dossier: getPerm("p_dossier"),
+          p_settings: getPerm("p_settings"),
+          p_manual: getPerm("p_manual"),
+          p_review: getPerm("p_review"),
+          p_build: getPerm("p_build")
+        }
+      };
+    });
+  } catch (e) {
+    Logger.log("Error in getAllAdminUsers: " + e.message);
+    return [];
+  }
+}
+/**
+ * 🚪 PORTIER DE CONNEXION : Authentification Staff
+ * Vérifie les identifiants, le statut du compte et les exigences de sécurité.
+ */
+function attemptSheetLogin(email, password) {
+  try {
+    const ss = DB.openById(MASTER_SPREADSHEET_ID);
+    const sh = ss.getSheetByName("Users");
+    if (!sh) return { success: false, message: "Base de données Users introuvable." };
+
+    const data = sh.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+
+    // 🗺️ MAPPING DYNAMIQUE DES COLONNES
+    const idx = {
+      email:  headers.indexOf("Email"),
+      pass:   headers.indexOf("Password"),
+      active: headers.indexOf("Active"),
+      reset:  headers.indexOf("Reset_Req")
+    };
+
+    // Validation de la configuration
+    if (idx.email === -1 || idx.pass === -1 || idx.active === -1) {
+      return { success: false, message: "Erreur de configuration : Colonnes manquantes." };
+    }
+
+    const target = email.toLowerCase().trim();
+    const hashed = hashPin(password);
+
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      
+      // 1️⃣ VÉRIFICATION IDENTIFIANTS (Email & Mot de Passe)
+      if (String(row[idx.email]).toLowerCase().trim() === target && String(row[idx.pass]).trim() === hashed) {
+        
+        // 2️⃣ VÉRIFICATION DU STATUT (Anti-Suspension)
+        // On vérifie si la colonne Active contient "TRUE"
+        const isActive = String(row[idx.active]).toUpperCase() === "TRUE";
+        if (!isActive) {
+          return { success: false, message: "🚫 Accès refusé : Votre compte a été suspendu par l'administration." };
+        }
+
+        // 3️⃣ VÉRIFICATION DU FORÇAGE DE RÉINITIALISATION
+        const needsReset = String(row[idx.reset]).toUpperCase() === "TRUE";
+        if (needsReset) {
+          return { 
+            success: true, 
+            status: "RESET_REQUIRED", 
+            message: "Première connexion : Veuillez définir votre mot de passe définitif." 
+          };
+        }
+
+        // 4️⃣ GÉNÉRATION DE SESSION (Succès)
+        const token = Utilities.getUuid();
+        CacheService.getScriptCache().put(token, target, 21600); // Valide 6 heures
+
+        return { success: true, status: "AUTHORIZED", token: token };
+      }
+    }
+
+    return { success: false, message: "Identifiants incorrects." };
+
+  } catch (e) {
+    console.error("Erreur Login : " + e.message);
+    return { success: false, message: "Erreur système lors de la connexion." };
+  }
+}
+/**
+ * --- QUIZ BUILDER BACKEND ---
+ */
+function getQuizQuestions(examTitle) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Exam_Questions");
+  
+  if (!sh || !examTitle) return [];
+
+  const data = sh.getDataRange().getValues();
+  const questions = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (String(row[0]).trim() === String(examTitle).trim()) {
+      questions.push({
+        text: row[1],
+        options: [row[2], row[3], row[4], row[5]].filter(opt => opt !== ""),
+        correct: row[6],
+        points: row[10] || 5, // Default 5 points
+        type: row[11] || "mcq"
+      });
+    }
+  }
+  return questions;
+}
+function addUser(obj) {
+  try {
+    const ss = SpreadsheetApp.openById(SUBMISSION_SHEET_ID);
+    const sh = ss.getSheetByName("Users");
+    let data = sh.getDataRange().getValues();
+    let headers = data[0].map(h => String(h).trim());
+
+    // --- LOGIQUE D'AJOUT AUTOMATIQUE DE COLONNE ---
+    let nameIdx = headers.indexOf("p_name");
+    if (nameIdx === -1) {
+      nameIdx = headers.length; // Prochaine colonne vide
+      sh.getRange(1, nameIdx + 1).setValue("p_name");
+      sh.getRange(1, nameIdx + 1).setFontWeight("bold");
+      headers.push("p_name"); // Mettre à jour l'index en mémoire
+      console.log("⚠️ Colonne 'p_name' ajoutée automatiquement.");
+    }
+
+    // Vérification si l'email existe déjà
+    const emailExists = data.some(row => row[0].toString().toLowerCase() === obj.email.toLowerCase());
+    if (emailExists) {
+      return { success: false, message: "Cet utilisateur existe déjà." };
+    }
+
+    // Préparation de la nouvelle ligne
+    // On crée un tableau vide de la taille des en-têtes pour éviter les décalages
+    let newRow = new Array(headers.length).fill("");
+    
+    // Remplissage selon les en-têtes détectés
+    newRow[headers.indexOf("Username")] = obj.email;
+    newRow[headers.indexOf("Password")] = obj.password || "123456";
+    newRow[headers.indexOf("Role")] = obj.role;
+    newRow[headers.indexOf("p_dossier")] = obj.permissions.p_dossier;
+    newRow[headers.indexOf("p_settings")] = obj.permissions.p_settings;
+    newRow[headers.indexOf("p_manual")] = obj.permissions.p_manual;
+    newRow[headers.indexOf("p_review")] = obj.permissions.p_review;
+    newRow[headers.indexOf("p_name")] = obj.permissions.p_name; // Enfin sauvegardé !
+
+    sh.appendRow(newRow);
+    return { success: true, message: "Utilisateur créé avec la permission Nom !" };
+
+  } catch (e) {
+    return { success: false, message: "Erreur : " + e.message };
+  }
+}
+function addQuizQuestion(q) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  let sh = ss.getSheetByName("Exam_Questions");
+  
+  if (!sh) {
+    checkAndInitSheets(); 
+    sh = ss.getSheetByName("Exam_Questions");
+  }
+
+  // Append: Title, Text, Opt1, Opt2, Opt3, Opt4, Correct, Comment, Media, URL, Points, Type
+  sh.appendRow([
+    q.exam, q.text, 
+    q.options[0]||"", q.options[1]||"", q.options[2]||"", q.options[3]||"", 
+    q.correct, "", "", "", q.points, q.type
+  ]);
+  return { success: true };
+}
+
+function addQuizQuestion(q) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  let sh = ss.getSheetByName("Exam_Questions");
+  
+  if (!sh) {
+    checkAndInitSheets(); 
+    sh = ss.getSheetByName("Exam_Questions");
+  }
+
+  sh.appendRow([
+    q.exam, q.text, 
+    q.options[0]||"", q.options[1]||"", q.options[2]||"", q.options[3]||"", 
+    q.correct, "", "", "", q.points, q.type
+  ]);
+  return { success: true };
+}
+
+function removeQuizQuestion(examTitle, questionIndex) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Exam_Questions");
+  const data = sh.getDataRange().getValues();
+  
+  let matchCount = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(examTitle).trim()) {
+      matchCount++;
+      if (matchCount === questionIndex) {
+        sh.deleteRow(i + 1);
+        return { success: true };
+      }
+    }
+  }
+  return { success: false };
+}
+/**
+ * REMOVE USER
+ * Deletes the row from the 'Users' sheet.
+ */
+function removeUserAccess(emailToRemove) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Users");
+  const data = sh.getDataRange().getValues();
+  const emailIdx = data[0].indexOf("Email");
+
+  for (let i = 1; i < data.length; i++) {
+    // Normalize logic
+    if (String(data[i][emailIdx]).toLowerCase().trim() === String(emailToRemove).toLowerCase().trim()) {
+      sh.deleteRow(i + 1); // Delete the spreadsheet row
+      return { success: true };
+    }
+  }
+  return { success: false, message: "Utilisateur introuvable." };
+}
+/**
+ * AJOUTER UNE COLONNE DANS LA FEUILLE SCORES
+ */
+function addNewSubjectToSheet(subjectName) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SCORES_SHEET);
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  
+  // Vérifier si le sujet existe déjà (en ignorant les espaces)
+  const exists = headers.some(h => String(h).trim().toLowerCase() === subjectName.trim().toLowerCase());
+  
+  if (exists) {
+    throw new Error("Ce sujet existe déjà dans la feuille Scores.");
+  }
+
+  // Ajouter la colonne à la fin
+  const newCol = sh.getLastColumn() + 1;
+  sh.getRange(1, newCol).setValue(subjectName.trim());
+  
+  // Appliquer le style (Violet comme les autres en-têtes)
+  sh.getRange(1, newCol).setBackground("#6a1b9a").setFontColor("white").setFontWeight("bold");
+  
+  return { success: true };
+}
+function submitScoreAndSend(payload) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  
+  // 1. IDENTIFICATION DE L'ÉTUDIANT (Dynamique)
+  const userSh = ss.getSheetByName(MASTER_SHEET_NAME); 
+  if (!userSh) {
+    Logger.log("ERREUR: Feuille utilisateur '" + MASTER_SHEET_NAME + "' introuvable.");
+    return { success: false, error: "Feuille utilisateur introuvable" };
+  }
+
+  const userData = userSh.getDataRange().getValues();
+  const userHeaders = userData[0].map(h => String(h).trim()); // Nettoyage des en-têtes (espaces cachés)
+  
+  // Recherche des index des colonnes par leurs noms exacts (Sensible à la casse)
+  const colIdIdx = userHeaders.indexOf("Student ID");
+  const colNameIdx = userHeaders.indexOf("Student_Name");
+  
+  // Détection de l'email (vérifie 'Email' ou 'Student Email')
+  let colEmailIdx = userHeaders.indexOf("Email");
+  if (colEmailIdx === -1) colEmailIdx = userHeaders.indexOf("Student Email");
+
+  const studentRow = userData.find(r => String(r[colIdIdx]).trim() === String(payload.studentCode).trim());
+  
+  let userEmail = null;
+  let studentFullName = payload.studentNameProvided;
+
+  if (studentRow) {
+    if (colEmailIdx !== -1) userEmail = String(studentRow[colEmailIdx]).trim();
+    if (colNameIdx !== -1) studentFullName = String(studentRow[colNameIdx]).trim();
+  }
+
+  Logger.log("DEBUG: Étudiant=" + studentFullName + " | Email trouvé=" + userEmail);
+
+  // 2. GESTION DE LA FEUILLE "SCORES"
+  const scoresSh = ss.getSheetByName(SCORES_SHEET);
+  let scoresHeaders = scoresSh.getRange(1, 1, 1, scoresSh.getLastColumn()).getValues()[0];
+  
+  const targetSubject = String(payload.subjectName).trim();
+  let colIdx = scoresHeaders.findIndex(h => String(h).trim().toLowerCase() === targetSubject.toLowerCase());
+
+  // CRÉATION AUTOMATIQUE DE L'EXAMEN DANS SCORES SI NON TROUVÉ
+  if (colIdx === -1) {
+    const newCol = scoresSh.getLastColumn() + 1;
+    scoresSh.getRange(1, newCol).setValue(targetSubject)
+      .setBackground("#6a1b9a") // Violet Meigens Tech
+      .setFontColor("white")
+      .setFontWeight("bold");
+    
+    colIdx = newCol - 1;
+  }
+
+  // 3. TROUVER OU CRÉER LA LIGNE ÉTUDIANT DANS "SCORES"
+  const scoresData = scoresSh.getDataRange().getValues();
+  let rowIdx = -1;
+  let existingScoreValue = "";
+
+  for (let i = 1; i < scoresData.length; i++) {
+    if (String(scoresData[i][0]).trim() === String(payload.studentCode).trim()) {
+      rowIdx = i + 1;
+      existingScoreValue = scoresData[i][colIdx];
+      break;
+    }
+  }
+
+  if (rowIdx === -1) {
+    scoresSh.appendRow([payload.studentCode, studentFullName]);
+    rowIdx = scoresSh.getLastRow();
+  }
+
+  // 4. LOGIQUE DE CALCUL ET PLAFONNEMENT (RETAKE)
+  let finalScore = payload.score;
+  if (existingScoreValue !== "" && existingScoreValue !== null && !isNaN(parseFloat(existingScoreValue)) && finalScore > 70) {
+    finalScore = 70; 
+  }
+
+  // Sauvegarde de la note
+  scoresSh.getRange(rowIdx, colIdx + 1).setValue(finalScore);
+
+  // 5. ARCHIVAGE DANS "EXAM_JSON"
+  const jsonSh = ss.getSheetByName(EXAM_JSON_SHEET) || ss.insertSheet(EXAM_JSON_SHEET);
+  jsonSh.appendRow([
+    payload.studentCode,
+    targetSubject,
+    new Date(),
+    finalScore,
+    JSON.stringify(payload.corrections),
+    "", // Teacher Comments
+    "TRUE" // Released
+  ]);
+
+  // 6. ENVOI DE L'EMAIL (Validation stricte)
+  if (userEmail && userEmail.includes("@")) {
+    try {
+      sendCorrectionEmail(userEmail, targetSubject, studentFullName, finalScore, payload.corrections);
+      Logger.log("SUCCÈS: Email de correction envoyé à " + userEmail);
+    } catch (e) {
+      Logger.log("ERREUR: Échec de l'envoi de l'email : " + e.message);
+    }
+  } else {
+    Logger.log("AVERTISSEMENT: Email invalide ou manquant dans la feuille Student_Users. Envoi annulé.");
+  }
+
+  return { success: true, finalScore: finalScore };
+}
+/**
+ * Construit et envoie un email détaillé de correction à l'étudiant.
+ */
+function sendCorrectionEmail(toEmail, subject, name, score, corrections) {
+  // Lien vers votre application web (Web App URL)
+  const webAppUrl = ScriptApp.getService().getUrl();
+
+  let body = `
+    <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; border: 1px solid #ddd; padding: 20px; border-radius: 8px;">
+      <h2 style="color: #6a1b9a; border-bottom: 2px solid #6a1b9a; padding-bottom: 10px;">
+        Correction de l'examen : ${subject}
+      </h2>
+      
+      <p>Bonjour <b>${name}</b>,</p>
+      
+      <p>Votre copie pour l'examen "<b>${subject}</b>" a été corrigée avec succès par l'administration académique.</p>
+      
+      <div style="background-color: #f9f9f9; padding: 15px; border-radius: 5px; text-align: center; margin: 20px 0;">
+        <span style="font-size: 16px;">Votre Note Finale :</span><br>
+        <span style="font-size: 28px; color: #6a1b9a; font-weight: bold;">${score} / 100</span>
+      </div>
+
+      <h3 style="color: #444;">Détails de la correction :</h3>
+      <hr style="border: 0; border-top: 1px solid #eee;">
+  `;
+  
+  // Parcours des questions pour l'affichage des erreurs et commentaires
+  corrections.forEach((c, i) => {
+    let isCorrect = (String(c.selectedLabel).trim() === String(c.correctLabel).trim());
+    let statusColor = isCorrect ? "#2e7d32" : "#c62828";
+    let statusText = isCorrect ? "✅ Correct" : "❌ Incorrect";
+    
+    body += `
+      <div style="margin-bottom: 20px;">
+        <p style="margin-bottom: 5px;"><b>Question ${i+1}:</b> ${c.question}</p>
+        <p style="margin: 0; font-size: 14px;">Statut : <span style="color:${statusColor}; font-weight:bold;">${statusText}</span></p>
+        <p style="margin: 0; font-size: 14px;">Votre réponse : <span style="color:${statusColor}">${c.selectedLabel || "(vide)"}</span></p>
+    `;
+
+    if(!isCorrect) {
+      body += `<p style="margin: 0; font-size: 14px;">Réponse attendue : <span style="color:#2e7d32; font-weight:bold;">${c.correctLabel}</span></p>`;
+    }
+
+    if(c.commentary) {
+      body += `<p style="margin-top: 5px; font-style: italic; color: #666; font-size: 13px;">💡 Note du correcteur : ${c.commentary}</p>`;
+    }
+
+    body += `</div><hr style="border: 0; border-top: 1px solid #eee;">`;
+  });
+
+  body += `
+      <p style="margin-top: 30px; text-align: center;">
+        <a href="${webAppUrl}" style="background-color: #6a1b9a; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+          Retourner au Portail Étudiant
+        </a>
+      </p>
+      
+      <p style="font-size: 12px; color: #888; text-align: center; margin-top: 40px;">
+        Ceci est un message automatique de Living Word School Of Ministries pour l'administration académique.
+      </p>
+    </div>
+  `;
+
+  MailApp.sendEmail({
+    to: toEmail,
+    subject: `Correction : ${subject} — ${name} (${score}/100)`,
+    htmlBody: body
+  });
+}
+function sendDelayedCorrections() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName("Results");
+  const data = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < data.length; i++) {
+    const [
+      timestamp,
+      studentCode,
+      studentName,
+      score,
+      subject,
+      correctionsJSON,
+      correctionsSent,
+      studentEmail
+    ] = data[i];
+
+    if (correctionsSent === true) continue;
+    if (!studentEmail || !correctionsJSON) continue;
+
+    const corrections = JSON.parse(correctionsJSON);
+
+    // 📨 Build email
+    let body = `
+Bonjour ${studentName},
+
+Voici la correction de votre examen :
+📘 ${subject}
+
+Score final : ${score} / 100
+
+----------------------------------
+`;
+
+    corrections.forEach((c, idx) => {
+      body += `
+Q${idx + 1}. ${c.question}
+Votre réponse : ${c.selectedLabel}
+Réponse correcte : ${c.correctLabel}
+Commentaire : ${c.commentary}
+
+`;
+    });
+
+    body += `
+Que Dieu vous bénisse,
+L'administration académique
+`;
+
+    MailApp.sendEmail({
+      to: studentEmail,
+      subject: `Correction de l'examen – ${subject}`,
+      body: body
+    });
+
+    // ✅ Mark as sent
+    sheet.getRange(i + 1, 7).setValue(true); // CorrectionsSent
+  }
+}
+/**
+ * Autorise un étudiant spécifique à passer un examen fermé (Colonne K)
+ */
+function addStudentException(examTitle, studentId) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SETTINGS_SHEET);
+  const data = sh.getDataRange().getValues();
+  const target = String(examTitle).trim();
+  
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][8]).trim() === target) {
+      let currentExceptions = String(data[i][10] || "").trim(); // Colonne K
+      let list = currentExceptions ? currentExceptions.split(",") : [];
+      
+      if (!list.includes(studentId)) {
+        list.push(studentId);
+        sh.getRange(i + 1, 11).setValue(list.join(",")); // Enregistre en Col K
+      }
+      return { success: true };
+    }
+  }
+  throw new Error("Examen non trouvé pour l'exception.");
+}
+
+function updateExamSettings(payload) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SETTINGS_SHEET);
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  
+  // 1. Détection dynamique des colonnes pour éviter tout décalage futur
+  const titleIdx = headers.indexOf("ExamTitle");     // Position de 'ExamTitle'
+  const acceptIdx = headers.indexOf("AcceptResponse") !== -1 ? headers.indexOf("AcceptResponse") : headers.indexOf("AcceptResponses");
+  const dueIdx = headers.indexOf("DueDate");
+  const releaseIdx = headers.indexOf("ReleaseMode");
+  const typeIdx = headers.indexOf("ExamType");
+
+  const targetTitle = String(payload.ExamTitle).trim();
+  let rowIndex = -1;
+
+  // 2. Recherche de la ligne par le titre de l'examen
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][titleIdx]).trim() === targetTitle) {
+      rowIndex = i + 1;
+      break;
+    }
+  }
+
+  // 3. Mise à jour ou Création
+  if (rowIndex !== -1) {
+    // On met à jour chaque colonne trouvée dynamiquement
+    if (acceptIdx !== -1) sh.getRange(rowIndex, acceptIdx + 1).setValue(payload.AcceptResponses);
+    if (dueIdx !== -1) sh.getRange(rowIndex, dueIdx + 1).setValue(payload.DueDate);
+    if (releaseIdx !== -1) sh.getRange(rowIndex, releaseIdx + 1).setValue(payload.ReleaseMode);
+    if (typeIdx !== -1) sh.getRange(rowIndex, typeIdx + 1).setValue(payload.ExamType);
+    
+    Logger.log("Mise à jour réussie pour : " + targetTitle);
+    return { success: true };
+  } else {
+    // Si l'examen n'existe pas dans Settings, on ajoute une nouvelle ligne
+    // Ordre : Settings, Value, OneSub, Accept, Active, Admins, DueDate, Release, Title, Type
+    // Note: Ajustez l'ordre ci-dessous si vous voulez un appendRow précis
+    sh.appendRow([
+      "Autorité", "TRUE", "TRUE", 
+      payload.AcceptResponses, 
+      "Exam", "", 
+      payload.DueDate, 
+      payload.ReleaseMode, 
+      targetTitle, 
+      payload.ExamType
+    ]);
+    return { success: true, status: "created" };
+  }
+}
+/**
+ * Récupère la dernière soumission JSON pour affichage dans l'Admin
+ */
+function getSubmissionForReview(studentId, examTitle) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Exam_JSON");
+  if (!sh) return null;
+
+  const data = sh.getDataRange().getValues();
+  // On parcourt de bas en haut pour avoir la soumission la plus récente
+  for (let i = data.length - 1; i >= 1; i--) {
+    if (String(data[i][0]).trim() === String(studentId).trim() && 
+        String(data[i][1]).trim() === String(examTitle).trim()) {
+      return {
+        studentId: data[i][0],
+        examTitle: data[i][1],
+        score: data[i][3],
+        questions: JSON.parse(data[i][4] || "[]")
+      };
+    }
+  }
+  return null;
+}
+/**
+ * Enregistre le thème personnalisé dans la feuille Settings (Colonne M)
+ */
+function saveThemeSettings(theme) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(SETTINGS_SHEET);
+  // On stocke le thème globalement sur la première ligne de réglages ou une feuille dédiée
+  sh.getRange("M1").setValue(JSON.stringify(theme)); 
+  return { success: true };
+}
+
+/**
+ * Enregistre les questions du Quiz Builder dans la feuille Exam_Questions
+ */
+function saveDynamicQuiz(examTitle, quizData) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Exam_Questions");
+  
+  // 1. Nettoyer les anciennes questions pour ce sujet
+  const data = sh.getDataRange().getValues();
+  for (let i = data.length - 1; i >= 1; i--) {
+    if (data[i][0] === examTitle) sh.deleteRow(i + 1);
+  }
+
+  // 2. Ajouter les nouvelles questions
+  quizData.forEach(q => {
+    sh.appendRow([
+      examTitle,          // A: Titre
+      q.text,             // B: Question
+      q.options[0] || "", // C: Opt 1
+      q.options[1] || "", // D: Opt 2
+      q.options[2] || "", // E: Opt 3
+      q.options[3] || "", // F: Opt 4
+      q.answer,           // G: Index Correct
+      "",                 // H: Commentaire
+      q.mediaType,        // I: Type Média (Nouveau)
+      q.mediaUrl,         // J: URL Média (Nouveau)
+      q.type              // K: Type Réponse (Radio/Check)
+    ]);
+  });
+  return { success: true };
+}
+
+/**
+ * CRITICAL: Ensures all required sheets exist and have the correct headers.
+ * Automatically repairs missing columns (like Password/Reset_Req) without data loss.
+ */
+function checkAndInitSheets() {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  
+  // Define the exact structure we need
+  const sheetDefinitions = [
+    {
+      name: "Users",
+      // 10 Columns total for the new Auth system
+      headers: [
+        "Email",       // A
+        "Role",        // B
+        "p_pic",       // C
+        "p_name",      // D
+        "p_dossier",   // E
+        "p_settings",  // F
+        "p_manual",    // G
+        "p_review",    // H
+        "Password",    // I (Hashed)
+        "Reset_Req"    // J (TRUE/FALSE)
+      ],
+      color: "#d1d1d1" // Grey
+    },
+    {
+      name: "Settings",
+      headers: ["Settings", "Value", "OneSubmission", "AcceptResponses", "ExamActive", "Admins", "DueDate", "ReleaseMode", "ExamTitle", "ExamType", "Whitelist", "ThemeJSON"],
+      color: "#f3f3f3"
+    },
+    {
+      name: "Scores",
+      headers: ["Student Code", "Student Name"], // Only enforce the first 2, others are dynamic exams
+      color: "#e8f5e9"
+    },
+    {
+      name: "Exam_JSON",
+      headers: ["Student Code", "Exam Slug", "Timestamp", "Score", "JSON", "Corrected_By", "Released"],
+      color: "#fff3e0"
+    },
+    {
+      name: "Exam_Questions",
+      headers: ["ExamTitle", "QuestionText", "Option1", "Option2", "Option3", "Option4", "CorrectIndex", "Commentary", "MediaType", "MediaURL", "ResponseType"],
+      color: "#e3f2fd"
+    }
+  ];
+
+  sheetDefinitions.forEach(def => {
+    let sheet = ss.getSheetByName(def.name);
+    
+    // --- SCENARIO 1: SHEET DOES NOT EXIST (Create it) ---
+    if (!sheet) {
+      sheet = ss.insertSheet(def.name);
+      
+      // Write Headers
+      sheet.getRange(1, 1, 1, def.headers.length)
+           .setValues([def.headers])
+           .setFontWeight("bold")
+           .setBackground(def.color);
+      
+      sheet.setFrozenRows(1);
+      Logger.log(`Created missing sheet: ${def.name}`);
+
+      // Special Case: Auto-add Owner to 'Users' sheet so you aren't locked out
+      if (def.name === "Users") {
+        const ownerEmail = Session.getEffectiveUser().getEmail();
+        sheet.appendRow([
+          ownerEmail, "Master", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "TRUE", "GOOGLE_AUTH", "FALSE"
+        ]);
+      }
+    } 
+    
+    // --- SCENARIO 2: SHEET EXISTS (Check for missing columns) ---
+    else {
+      const currentLastCol = sheet.getLastColumn();
+      
+      // If the sheet is empty (no headers at all), just write them
+      if (currentLastCol === 0) {
+         sheet.getRange(1, 1, 1, def.headers.length)
+           .setValues([def.headers])
+           .setFontWeight("bold")
+           .setBackground(def.color);
+         return;
+      }
+
+      // Read existing headers
+      const currentHeaders = sheet.getRange(1, 1, 1, currentLastCol).getValues()[0].map(h => String(h).trim());
+
+      // Loop through required headers and check if they exist
+      def.headers.forEach((reqHeader, index) => {
+        // We use the index to check strictly (Col 1 should be Email, Col 9 Password, etc.)
+        // Or we check if it exists *anywhere* if order doesn't matter (usually order matters for mapping)
+        
+        // Simple approach: If the sheet has fewer columns than required, append the missing ones at the end
+        if (index >= currentLastCol) {
+           // This header is missing (e.g., 'Password' is at index 8, but sheet only has 8 columns (0-7))
+           sheet.getRange(1, index + 1).setValue(reqHeader)
+                .setFontWeight("bold")
+                .setBackground(def.color);
+           Logger.log(`Repaired ${def.name}: Added missing header '${reqHeader}'`);
+        }
+        else {
+           // Optional: Fix header name if it's wrong/renamed? 
+           // Usually better to leave existing data alone unless empty.
+           const existingHeader = currentHeaders[index];
+           if (!existingHeader) {
+              sheet.getRange(1, index + 1).setValue(reqHeader).setFontWeight("bold");
+           }
+        }
+      });
+    }
+  });
+}
+/**
+ * Ajoute dynamiquement une nouvelle colonne d'examen dans la feuille Scores
+ * et initialise les paramètres dans la feuille Settings.
+ */
+function addNewSubjectToSheet(subjectName) {
+  checkAndInitSheets();
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  
+  // 1. Mise à jour de la feuille "Scores"
+  const sh = ss.getSheetByName("Scores");
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  
+  if (headers.indexOf(subjectName) === -1) {
+    sh.getRange(1, sh.getLastColumn() + 1).setValue(subjectName)
+      .setFontWeight("bold")
+      .setBackground("#e8f5e9");
+    
+    // 2. Mise à jour de la feuille "Settings" selon l'ordre de l'image
+    const setSh = ss.getSheetByName("Settings");
+    
+    // Structure basée sur votre capture d'écran :
+    // A: Settings | B: Value | C: OneSubmission | D: AcceptResponse | E: ExamActive 
+    // F: Admins | G: DueDate | H: ReleaseMode | I: ExamTitle | J: ExamType
+    
+    const newSettingsRow = [
+      "Autorité",       // A: Settings (Valeur fixe vue sur l'image)
+      "TRUE",            // B: Value
+      "TRUE",            // C: OneSubmission
+      "TRUE",            // D: AcceptResponse
+      "Exam",            // E: ExamActive
+      "",                // F: Admins (vide)
+      "2026-02-10 1:33", // G: DueDate (exemple de date)
+      "immediate",       // H: ReleaseMode
+      subjectName,       // I: ExamTitle (Le nom du sujet)
+      "homework"         // J: ExamType
+    ];
+    
+    setSh.appendRow(newSettingsRow);
+  }
+  
+  return { success: true };
+}
+/**
+ * Fetches questions from "Exam_Questions" and applies the limit 
+ * based on ExamType found in "Settings".
+ */
+function getQuestionsForStudent(examTitle) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  
+  // 1. Get the Limit from Settings
+  const settingsSh = ss.getSheetByName(SETTINGS_SHEET);
+  const settingsData = settingsSh.getDataRange().getValues();
+  const settingsHeaders = settingsData[0];
+  const typeIdx = settingsHeaders.indexOf("ExamType"); // Col J
+  const titleIdx = settingsHeaders.indexOf("ExamTitle"); // Col G
+  
+  let limit = 10; // Default fallback
+  const settingRow = settingsData.find(r => String(r[titleIdx]).trim() === String(examTitle).trim());
+  
+  if (settingRow) {
+    const type = String(settingRow[typeIdx]).toLowerCase().trim();
+    if (type === "homework") {
+      limit = 30;
+    } else {
+      limit = 10; // "examen"
+    }
+  }
+
+  // 2. Get All Questions for this Subject
+  const qSh = ss.getSheetByName("Exam_Questions");
+  const qData = qSh.getDataRange().getValues();
+  qData.shift(); // Remove headers
+
+  let filteredQuestions = qData
+    .filter(r => String(r[0]).trim() === String(examTitle).trim())
+    .map(r => ({
+      text: r[1],
+      options: [r[2], r[3], r[4], r[5]].filter(o => o !== ""),
+      answer: r[6],
+      mediaType: r[8],
+      mediaUrl: r[9],
+      type: r[10]
+    }));
+
+  // 3. Shuffle and Slice to the limit
+  return shuffleArray(filteredQuestions).slice(0, limit);
+}
+
+// Helper to shuffle questions so every student gets a different order
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
+/**
+ * GET EXAM SETTINGS (Prevents Null Crash)
+ */
+function getExamSettings(examTitle = null) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  let sh = ss.getSheetByName("Settings");
+  
+  // Default Safe Object
+  const defaults = {
+    AcceptResponses: "FALSE",
+    ReleaseMode: "hidden",
+    ExamType: "examen",
+    DueDate: ""
+  };
+
+  // If sheet doesn't exist, create it with correct headers
+  if (!sh) {
+    sh = ss.insertSheet("Settings");
+    const headers = ["ExamTitle", "AcceptResponses", "ReleaseMode", "ExamType", "DueDate", "OneSubmission", "ExamActive", "ThemeJSON"];
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
+    return defaults;
+  }
+
+  const data = sh.getDataRange().getValues();
+  // Safe Header Lookup
+  const h = data[0].map(x => String(x).toLowerCase().trim());
+  const titleIdx = h.indexOf("examtitle");
+
+  // If "ExamTitle" column is missing, return defaults
+  if (titleIdx === -1) return defaults;
+
+  // Search for the specific exam
+  for (let i = 1; i < data.length; i++) {
+    const rowTitle = String(data[i][titleIdx]).trim();
+    // Return specific exam settings OR the first one found if none specified
+    if ((examTitle && rowTitle === examTitle) || (!examTitle && rowTitle !== "")) {
+      return {
+        AcceptResponses: String(data[i][h.indexOf("acceptresponses")]).toLowerCase() === "true" ? "true" : "false",
+        ReleaseMode: data[i][h.indexOf("releasemode")] || "hidden",
+        ExamType: data[i][h.indexOf("examtype")] || "examen",
+        DueDate: data[i][h.indexOf("duedate")] || ""
+      };
+    }
+  }
+  
+  return defaults;
+}
+  
+/**
+ * Vérifie si l'étudiant peut accéder à l'examen ou s'il doit consulter sa copie
+ */
+function checkEligibility() {
+  const code = document.getElementById("studentCodeInput").value;
+  const examTitle = "<?= examName ?>"; // Défini dynamiquement par le serveur
+  const statusDiv = document.getElementById("statusMessage");
+  const startBtn = document.getElementById("startBtn"); // Le bouton pour lancer l'épreuve
+
+  // Réinitialisation de l'affichage avant la vérification
+  statusDiv.innerHTML = "Vérification en cours... <span class='spinner'></span>";
+  statusDiv.style.color = "#6a1b9a";
+  if (startBtn) startBtn.style.display = "none";
+
+  google.script.run.withSuccessHandler(res => {
+    // CAS 1 : EXAMEN DÉJÀ RÉUSSI (Lien de consultation type Google Form)
+    if (res.AcceptResponses === "ALREADY_PASSED") {
+      let message = `Accès refusé : Vous avez déjà réussi cet examen avec une note de <b>${res.score}/100</b>.`;
+      
+      // Si l'administration a libéré les résultats dans 'Settings' (mode différent de 'hidden')
+      if (res.releaseMode !== "hidden") {
+        message += `<br><br>
+          <div style="background: #e8f5e9; padding: 12px; border-radius: 8px; border: 1px solid #2e7d32;">
+            <a href="#" onclick="openStudentReview('${res.examSlug}')" style="color:#2e7d32; text-decoration:none; font-weight:600; display:flex; align-items:center; justify-content:center; gap:8px;">
+              👁️ Voir ma copie et les corrections détaillées
+            </a>
+          </div>`;
+      } else {
+        message += `<br><small style="color:#666;">(La correction détaillée n'est pas encore disponible)</small>`;
+      }
+      
+      statusDiv.innerHTML = message;
+      statusDiv.style.color = "#d32f2f"; // Rouge pour l'erreur
+    }
+
+    // CAS 2 : EXAMEN FERMÉ PAR L'ADMINISTRATION
+    else if (res.AcceptResponses === "FALSE") {
+      statusDiv.innerHTML = "Désolé, cet examen est actuellement fermé ou n'accepte plus de réponses.";
+      statusDiv.style.color = "#d32f2f";
+    }
+
+    // CAS 3 : ACCÈS AUTORISÉ (Normal, Rattrapage ou Retard)
+    else {
+      if (startBtn) startBtn.style.display = "block";
+      
+      if (res.AcceptResponses === "RETAKE_MODE") {
+        statusDiv.innerHTML = "<b>Mode Rattrapage :</b> Votre note précédente était insuffisante. Cette nouvelle tentative sera plafonnée à 70%.";
+        statusDiv.style.color = "#ef6c00"; // Orange
+      } 
+      else if (res.AcceptResponses === "LATE_SUBMISSION_MODE") {
+        statusDiv.innerHTML = "<b>Attention :</b> La date limite est dépassée. Votre soumission sera enregistrée avec un retard.";
+        statusDiv.style.color = "#ef6c00";
+      } 
+      else {
+        statusDiv.innerHTML = "Identification réussie. Vous pouvez commencer l'épreuve.";
+        statusDiv.style.color = "#2e7d32"; // Vert
+      }
+    }
+  }).getSpecificExamSettings(examTitle, code);
+}
+/**
+ * Enregistre la note et archive le détail JSON
+ */
+function processExamSubmission(payload) {
+  const ss = getHomeworkSpreadsheet_();
+  
+  // 1. Enregistre la note brute dans la feuille Scores
+  const scoreResult = submitScoreAndSend(payload);
+  
+  // 2. Archive le détail des réponses pour la correction manuelle/révision
+  writeExamJson(payload.studentCode, payload.subjectName, scoreResult.finalScore, payload.corrections);
+
+  return { 
+    success: true, 
+    finalScore: scoreResult.finalScore,
+    message: scoreResult.finalScore >= 70 ? "Félicitations, examen réussi !" : "Note enregistrée."
+  };
+}
+function logoutAdmin() {
+  PropertiesService.getUserProperties().deleteProperty("SESSION_EMAIL");
+  return { success: true };
+}
+
+/**
+ * Recherche les étudiants basés sur le statut ReleaseMode de la feuille Settings
+ */
+function getUnreleasedStudents(examTitle) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID); //
+  const settingsSh = ss.getSheetByName(SETTINGS_SHEET); //
+  const sData = settingsSh.getDataRange().getValues();
+  const sHeaders = sData[0];
+  
+  const titleIdx = sHeaders.indexOf("ExamTitle"); //
+  const releaseIdx = sHeaders.indexOf("ReleaseMode"); //
+  
+  const examSetting = sData.find(r => String(r[titleIdx]).trim() === String(examTitle).trim());
+  
+  // Si déjà en mode 'immediate' dans Settings, on considère tout libéré
+  if (examSetting && String(examSetting[releaseIdx]).toLowerCase() === "immediate") {
+    return [];
+  }
+
+  const scoresSh = ss.getSheetByName(SCORES_SHEET); //
+  const data = scoresSh.getDataRange().getValues();
+  const headers = data[0];
+  const examColIdx = headers.indexOf(examTitle);
+  const nameIdx = headers.indexOf("Student Name");
+
+  const unreleasedList = [];
+  for (let i = 1; i < data.length; i++) {
+    const score = data[i][examColIdx];
+    if (score !== "" && score !== null) {
+      unreleasedList.push({
+        id: data[i][0], 
+        name: data[i][nameIdx] || "Étudiant " + data[i][0],
+        score: score
+      });
+    }
+  }
+  return unreleasedList;
+}
+
+/**
+ * Envoie les emails et met à jour ReleaseMode dans Settings vers 'immediate'
+ */
+function processBulkRelease(studentIds, examTitle) {
+  let sentCount = 0;
+  studentIds.forEach(id => {
+    try {
+      emailDetailedCorrection(id, examTitle); //
+      sentCount++;
+    } catch (e) {
+      Logger.log("Erreur d'envoi pour l'ID " + id + ": " + e.message);
+    }
+  });
+
+  // Mise à jour de la feuille Settings
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID); //
+  const sh = ss.getSheetByName(SETTINGS_SHEET); //
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  const titleIdx = headers.indexOf("ExamTitle"); //
+  const releaseIdx = headers.indexOf("ReleaseMode"); //
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][titleIdx]).trim() === String(examTitle).trim()) {
+      sh.getRange(i + 1, releaseIdx + 1).setValue("immediate"); //
+      break;
+    }
+  }
+
+  return { sent: sentCount };
+}
+/**
+ * Automatically syncs data from Source to Archive on load.
+ * Includes a 10-minute cooldown to prevent performance issues.
+ */
+function syncStudentDataOnLoad() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get("DATA_SYNCED_RECENTLY");
+
+  // If we synced in the last 10 minutes, skip to save speed
+  if (cached) {
+    Logger.log("Skipping sync: Data synced recently.");
+    return; 
+  }
+
+  Logger.log("Starting Auto-Archive Sync...");
+
+  // 1. Setup Spreadsheets
+  const sourceSS = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+  const sourceSheet = sourceSS.getSheetByName("StudentData");
+  
+  const masterSS = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const targetSheet = masterSS.getSheetByName(MASTER_SHEET_NAME); // "Student_Users"
+
+  if (!sourceSheet || !targetSheet) return;
+
+  // 2. Get Data
+  const sourceData = sourceSheet.getDataRange().getValues();
+  const sourceHeaders = sourceData.shift(); // Remove headers
+  
+  const targetData = targetSheet.getDataRange().getValues();
+  const targetHeaders = targetData.shift(); // Remove headers
+
+  // 3. Map Headers (Find column indexes)
+  // Source Map
+  const sMap = {
+    code: sourceHeaders.indexOf("Code"),
+    name: sourceHeaders.indexOf("Nom"),
+    phone: sourceHeaders.indexOf("Téléphone"),
+    address: sourceHeaders.indexOf("Adresse"),
+    photo: sourceHeaders.indexOf("PhotoURL"),
+    blood: sourceHeaders.indexOf("Groupe Sanguin")
+  };
+
+  // Target Map (Archive)
+  const tMap = {
+    id: targetHeaders.indexOf("Student ID"),
+    name: targetHeaders.indexOf("Student_Name"),
+    phone: targetHeaders.indexOf("Phone_Number"),
+    address: targetHeaders.indexOf("Address"),
+    photo: targetHeaders.indexOf("Picture_URL"),
+    blood: targetHeaders.indexOf("Blood_Type")
+  };
+
+  if (sMap.code === -1 || tMap.id === -1) return; // Cannot map IDs
+
+  // 4. Create Map of Existing Archive Users for fast lookup
+  const archiveMap = new Map();
+  targetData.forEach((row, index) => {
+    const id = String(row[tMap.id]).trim().toUpperCase();
+    if (id) archiveMap.set(id, index + 2); // Store Row Number (1-based index + header)
+  });
+
+  // 5. Iterate Source and Update/Append
+  let updates = 0;
+  let newRecords = 0;
+
+  sourceData.forEach(row => {
+    const code = String(row[sMap.code]).trim().toUpperCase();
+    if (!code) return;
+
+    // Helper to get source value safely
+    const getVal = (idx) => (idx !== -1 && row[idx]) ? row[idx] : "";
+
+    if (archiveMap.has(code)) {
+      // --- UPDATE EXISTING ---
+      const rowNum = archiveMap.get(code);
+      // Only update if source has data (Don't overwrite with empty)
+      if (getVal(sMap.name)) targetSheet.getRange(rowNum, tMap.name + 1).setValue(getVal(sMap.name));
+      if (getVal(sMap.phone)) targetSheet.getRange(rowNum, tMap.phone + 1).setValue(getVal(sMap.phone));
+      if (getVal(sMap.photo)) targetSheet.getRange(rowNum, tMap.photo + 1).setValue(getVal(sMap.photo));
+      if (getVal(sMap.address)) targetSheet.getRange(rowNum, tMap.address + 1).setValue(getVal(sMap.address));
+      if (getVal(sMap.blood)) targetSheet.getRange(rowNum, tMap.blood + 1).setValue(getVal(sMap.blood));
+      updates++;
+    } else {
+      // --- APPEND NEW ---
+      // Create an empty row with correct length
+      const newRow = new Array(targetHeaders.length).fill("");
+      
+      // Fill known fields
+      newRow[tMap.id] = code;
+      newRow[tMap.name] = getVal(sMap.name);
+      newRow[tMap.phone] = getVal(sMap.phone);
+      newRow[tMap.photo] = getVal(sMap.photo);
+      newRow[tMap.address] = getVal(sMap.address);
+      newRow[tMap.blood] = getVal(sMap.blood);
+      
+      targetSheet.appendRow(newRow);
+      newRecords++;
+    }
+  });
+
+  Logger.log(`Sync Complete. Updated: ${updates}, New: ${newRecords}`);
+  
+  // Set Cache to prevent running again for 10 minutes (600 seconds)
+  cache.put("DATA_SYNCED_RECENTLY", "true", 600);
+}
+
+/**
+ * 2. GETS CURRENT USER (Supports Google ID OR Token)
+ */
+function getEffectiveAdminUser(token) {
+  // A. Try Google Login (Admin Link)
+  const googleEmail = Session.getActiveUser().getEmail();
+  if (googleEmail) return googleEmail;
+
+  // B. Try Token Login (Student Link Fallback)
+  if (token) {
+    const cachedEmail = CacheService.getScriptCache().get(token);
+    if (cachedEmail) return cachedEmail;
+  }
+
+  return null; // Not logged in
+}
+
+/**
+ * 3. SECURE WRAPPER FOR ADMIN FUNCTIONS
+ * Use this at the start of every Admin function (getAllSubmissions, etc.)
+ */
+function verifyAdminAccess(token) {
+  const email = getEffectiveAdminUser(token);
+  if (!email || !isAdminEmail(email)) {
+    throw new Error("⛔ Accès refusé. Veuillez vous reconnecter.");
+  }
+  return email; // Returns the email so you know who is acting
+}
+/**
+ * SAVE THEME
+ * Stores the color JSON in the Settings sheet (Row 2, Column ThemeJSON)
+ */
+function saveThemeSettings(themeJson) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName("Settings");
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const themeCol = headers.indexOf("ThemeJSON") + 1;
+
+  if (themeCol > 0) {
+    // We store it in the first data row (Row 2) as a Global Setting
+    sh.getRange(2, themeCol).setValue(themeJson);
+    return { success: true };
+  }
+  return { success: false };
+}
+/*************************************************
+ * FONCTION DE RENDU (À METTRE TOUT EN BAS)
+ *************************************************/
+function render(file, title) {
+  try {
+    return HtmlService.createTemplateFromFile(file)
+      .evaluate()
+      .setTitle(title)
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  } catch (e) {
+    Logger.log("Erreur lors du rendu du fichier " + file + ": " + e.toString());
+    return HtmlService.createHtmlOutput("<h2>Erreur : Le fichier HTML '" + file + "' est introuvable ou contient une erreur.</h2>");
+  }
+}
+/**
+ * GET THEME
+ * Helper to retrieve the theme string
+ */
+function getStoredTheme() {
+  try {
+    const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+    const sh = ss.getSheetByName("Settings");
+    const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+    const themeCol = headers.indexOf("ThemeJSON") + 1;
+    
+    if (themeCol > 0 && sh.getLastRow() > 1) {
+      return sh.getRange(2, themeCol).getValue();
+    }
+  } catch(e) {
+    Logger.log("Error fetching theme: " + e);
+  }
+  return "";
+}
+// Add this to the very bottom of Code.gs
+function getScriptUrl() {
+  return ScriptApp.getService().getUrl();
+}
+function verifyStudentByLast4(last4) {
+  const ss = SpreadsheetApp.openById(MASTER_SPREADSHEET_ID);
+  const sh = ss.getSheetByName(MASTER_SHEET_NAME); 
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  
+  // Robust Column Lookup
+  const idIdx = headers.indexOf("Student ID");
+  const nameIdx = headers.indexOf("Student_Name");
+  
+  // This looks for "Picture_URL", "PhotoURL", or "Photo" automatically
+  let picIdx = headers.indexOf("Picture_URL");
+  if (picIdx === -1) picIdx = headers.indexOf("PhotoURL");
+  if (picIdx === -1) picIdx = headers.indexOf("Photo");
+
+  if (idIdx === -1) return { found: false, error: "ID column not found" };
+
+  const target = String(last4).trim();
+  
+  for (let i = 1; i < data.length; i++) {
+    const fullId = String(data[i][idIdx]).trim();
+    
+    if (fullId.endsWith(target) && target.length >= 4) {
+       let rawUrl = (picIdx !== -1) ? String(data[i][picIdx]).trim() : "";
+       let cleanUrl = "";
+
+       // Convert Google Drive links to thumbnails
+       if (rawUrl && rawUrl.includes("drive.google.com")) {
+         let idMatch = rawUrl.match(/id=([a-zA-Z0-9_-]+)/) || rawUrl.match(/\/d\/([a-zA-Z0-9_-]+)\//);
+         if (idMatch) cleanUrl = "https://drive.google.com/thumbnail?id=" + idMatch[1] + "&sz=w300";
+       } else {
+         cleanUrl = rawUrl; // Use as-is if not Drive link
+       }
+
+       return {
+         found: true,
+         student: {
+           Student_ID: fullId,
+           Student_Name: (nameIdx !== -1 ? data[i][nameIdx] : "Étudiant"),
+           Picture_URL: cleanUrl
+         }
+       };
+    }
+  }
+  return { found: false };
+}
+/**
+ * Vérifie si une note existe déjà pour un étudiant et un examen précis.
+ */
+function getExistingGrade(studentCode, examTitle) {
+  try {
+    const ss = SpreadsheetApp.openById(SUBMISSION_SHEET_ID);
+    const sh = ss.getSheetByName(SCORES_SHEET);
+    
+    if (!sh) return { found: false };
+
+    const data = sh.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+
+    const codeIdx = headers.indexOf("Student Code");
+    const examColIdx = headers.indexOf(String(examTitle).trim());
+
+    if (codeIdx === -1 || examColIdx === -1) return { found: false };
+
+    // Recherche de l'étudiant par son code
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][codeIdx]).trim() === String(studentCode).trim()) {
+        const grade = data[i][examColIdx];
+        // On considère que la note existe si la cellule n'est pas vide
+        if (grade !== "" && grade !== null) {
+          return { found: true, grade: grade };
+        }
+        break; 
+      }
+    }
+    return { found: false };
+
+  } catch (e) {
+    Logger.log("Erreur dans getExistingGrade: " + e.message);
+    return { found: false, error: e.message };
+  }
+}
